@@ -1,0 +1,114 @@
+import os
+import sys
+import time
+import signal
+import psutil
+import logging
+from typing import List, Set, Dict, Any
+
+# Configure high-performance logging pipeline
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] [AXIOM_TRIGGER_ENGINE] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+class ProcessAutoKillTrigger:
+    """
+    Advanced Threaded Process Monitoring and Automated Termination System.
+    Monitors process execution trees against threat signatures and usage thresholds.
+    """
+    def __init__(self, target_process_names: List[str], max_cpu_percent: float = 90.0, poll_interval: float = 1.0):
+        self.target_names: Set[str] = {name.lower() for name in target_process_names}
+        self.max_cpu_percent = max_cpu_percent
+        self.poll_interval = poll_interval
+        self.is_active = False
+
+    def scan_and_enforce(self) -> Dict[str, Any]:
+        metrics = {"scanned": 0, "terminated": 0, "errors": 0}
+        
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent']):
+            metrics["scanned"] += 1
+            try:
+                proc_info = proc.info
+                p_name = (proc_info['name'] or "").lower()
+                p_pid = proc_info['pid']
+
+                # Prevent self-termination or system critical drops
+                if p_pid == os.getpid() or p_pid <= 4:
+                    continue
+
+                is_target = p_name in self.target_names
+                cpu_exceeded = False
+
+                if not is_target:
+                    try:
+                        cpu_usage = proc.cpu_percent(interval=None)
+                        if cpu_usage > self.max_cpu_percent:
+                            cpu_exceeded = True
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+
+                if is_target or cpu_exceeded:
+                    reason = "Blacklisted Signature" if is_target else f"CPU Exceeded ({proc_info.get('cpu_percent')}%"
+                    logging.warning(f"Target Acquired -> PID: {p_pid} | Name: {p_name} | Reason: {reason}")
+                    
+                    self._execute_kill_sequence(proc, p_pid, p_name)
+                    metrics["terminated"] += 1
+
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+            except psutil.AccessDenied:
+                metrics["errors"] += 1
+                continue
+            except Exception as e:
+                logging.error(f"Unexpected error inspecting PID {proc.info.get('pid')}: {e}")
+                metrics["errors"] += 1
+
+        return metrics
+
+    def _execute_kill_sequence(self, proc: psutil.Process, pid: int, name: str) -> None:
+        """Executes a non-blocking progressive SIGTERM -> SIGKILL cascade."""
+        try:
+            logging.info(f"Issuing SIGTERM to PID {pid} [{name}]...")
+            proc.terminate()
+            
+            # Allow graceful exit window before force kill
+            gone, alive = psutil.wait_procs([proc], timeout=0.5)
+            if alive:
+                logging.warning(f"PID {pid} [{name}] non-responsive. Issuing SIGKILL...")
+                proc.kill()
+                
+            logging.info(f"Target PID {pid} [{name}] successfully neutralized.")
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            logging.info(f"Process PID {pid} exited prior to kill dispatch.")
+        except psutil.AccessDenied as e:
+            logging.error(f"Access Denied: Unable to kill PID {pid}. Elevate privileges. Error: {e}")
+
+    def run_engine(self) -> None:
+        """Starts the continuous telemetry and trigger execution loop."""
+        self.is_active = True
+        logging.info("Auto-Kill Trigger Engine initialized and active.")
+        
+        try:
+            while self.is_active:
+                cycle_results = self.scan_and_enforce()
+                logging.debug(f"Scan complete: {cycle_results['scanned']} scanned, {cycle_results['terminated']} killed.")
+                time.sleep(self.poll_interval)
+        except KeyboardInterrupt:
+            logging.info("Engine termination signal received. Shutting down gracefully...")
+            self.is_active = False
+
+if __name__ == "__main__":
+    # Define system process targets for automated monitoring and termination
+    TARGET_PROCESSES = ["unauthorized_daemon.exe", "bad_process", "test_runaway_app"]
+    
+    engine = ProcessAutoKillTrigger(
+        target_process_names=TARGET_PROCESSES,
+        max_cpu_percent=95.0,
+        poll_interval=1.0
+    )
+    
+    engine.run_engine()
